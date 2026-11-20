@@ -23,6 +23,32 @@ const NUMBERS = /^\s*\d+(\s+\d+)*\s*$/
 
 const secretField = key => key.replace(/[A-Z]/g, char => `_${char}`).toUpperCase()
 
+// Whether a `user/message` is the host talking to the model about the turn rather
+// than someone asking for it. DSH marks every context message it forms with a
+// `form`: `snapshot` for the clock, the working directory and a memory recall,
+// `catalog` for the skill list, `instructions` for a loaded skill, `notice` for an
+// approval or a model switch. Listing the kinds instead meant the next one the host
+// invented — `time-context` after `runtime-context` — silently took the chat's
+// origin down with it, so the test is what a context message is, not a list.
+//
+// The kinds that do count as someone asking are named, because each one carries a
+// `form` the marker alone would read as context:
+//  - `bot`: a peer Bot's message is `relay`, but it is an ask, and the answer
+//    belongs to that exchange, never to this chat.
+//  - `webhook`: an outside system, marked `notice`.
+//  - `schedule`: a timed task firing in the same Session.
+//  - `agent-message`, `team-message`: another agent asking, not context.
+//  - `user`: the person; reading it as context would leave the chat unsendable.
+const ASKING_KINDS = new Set([SOURCE_KIND, 'webhook', 'schedule', 'agent-message', 'team-message', 'user'])
+// Injected by the host without a form, so the marker cannot see them.
+const CONTEXT_WITHOUT_FORM = new Set(['compact-checkpoint', 'session-reference', 'working-directory'])
+const isHostContext = (source) => {
+  if (source === undefined || source === null) return false
+  if (ASKING_KINDS.has(source.kind)) return false
+  if (CONTEXT_WITHOUT_FORM.has(source.kind)) return true
+  return typeof source.form === 'string' && source.form !== ''
+}
+
 export function install(rt) {
   const { ctx, state } = rt
   const imDir = join(rt.home, 'im')
@@ -471,9 +497,18 @@ export function install(rt) {
   const detachHeldOrigin = (sessionId) => {
     for (const held of resumedOrigins.values()) if (held.activeOn === sessionId) held.activeOn = undefined
   }
-  const claimOrigin = (sessionId, connId, chatKey, senderId, binding) => {
+  // `fromRequest` says the claim carries a request this process registered for an IM
+  // message it just accepted. Such a claim is authoritative: it names the chat the turn
+  // answers, so a stale hold left by an earlier turn of the same Session must not veto
+  // it. A Bot's Session moves to a fresh part (its id changes), and the old part's hold
+  // is what marks the new part mixed; without this the chat loses its voice for good.
+  const claimOrigin = (sessionId, connId, chatKey, senderId, binding, fromRequest = false) => {
     if (sessionId === undefined || connId === undefined) return
-    if (mixed.has(sessionId)) return
+    if (mixed.has(sessionId)) {
+      if (fromRequest !== true) return
+      // An IM message the user just sent re-opens the chat's claim on this Session.
+      mixed.delete(sessionId)
+    }
     const previous = origins.get(sessionId)
     if (previous !== undefined && (previous.connId !== connId || previous.chatKey !== chatKey || previous.senderId !== senderId)) {
       dropOrigin(sessionId)
@@ -811,7 +846,13 @@ export function install(rt) {
       await sendText(conn, msg.chat, text(msg.chat.kind === 'group' ? 'unboundGroup' : 'unbound'))
       return
     }
-    const sessionId = target.botId ?? target.roomId
+    // The turn this message starts runs in the Session that currently speaks for the
+    // Bot, not in the id the roster first gave it: a Bot's chat moves to a fresh part
+    // (sessionId changes, botId stays), and a message written under the old id is
+    // replayed into the new part without the request this process just registered —
+    // the origin then never gets claimed and the chat hears nothing back.
+    const activeSession = target.botId !== undefined ? (rt.chatOf(target.botId) ?? target.botId) : target.roomId
+    const sessionId = activeSession
     // The receipt has to sit on the Session that takes the message. A group's own
     // Session moves on to a fresh part (`room.sessionId`) while `room.id` stays the
     // first one, so uploading under the id leaves the receipt on a Session the
@@ -1458,14 +1499,22 @@ export function install(rt) {
         // process never registered — after a restart, or a redelivery — leaves no origin.
         const asked = requests.get(rpcId)
         requests.delete(rpcId)
-        if (asked === undefined) dropOrigin(session.id)
-        else claimOrigin(session.id, asked.connId, asked.chatKey, asked.senderId, asked.binding)
+        if (asked === undefined) {
+          dropOrigin(session.id)
+        }
+        else claimOrigin(session.id, asked.connId, asked.chatKey, asked.senderId, asked.binding, true)
       } else if (source?.kind === REPLY_KIND) {
         // Web and phone answers carry no registered IM request.
         dropOrigin(session.id)
       } else if (source?.kind === SOURCE_KIND && source.role === 'post') {
         // A member's late result relayed into the group's own Session. The group's work
         // is still the answer to the chat that asked, wherever the member runs.
+      } else if (isHostContext(source)) {
+        // The host hangs its own context onto the turn right after the message that
+        // started it: the clock, the working directory, the skill catalog, a memory
+        // recall, a compaction checkpoint, an approval notice. None of them is
+        // another person speaking, so none may decide where the answer goes. Dropping
+        // the origin here silenced the very reply the message before it asked for.
       } else {
         // A message from the Web UI, a peer Bot or a scheduled task: this turn is not an
         // IM chat's to answer, even when an earlier turn of this Session was.
@@ -1483,13 +1532,18 @@ export function install(rt) {
         resetOrigin(session.id)
       }
     }
-    const botId = rt.chatOwners.get(session.id)
+    const botId = rt.chatOwners.get(session.id) ?? rt.pastOwners.get(session.id)?.botId
     if (botId === undefined) {
       // A group's own chat has no Bot of its own; its lines go out from onRoomLine.
       imVia.delete(session.id)
       return
     }
-    const origin = originOf(session.id)
+    // A Bot's chat moves to a new Session when its conversation is long enough to
+    // continue in another part, and the IM origin stays on the Session that took
+    // the user's message — the Bot's own id. Look the origin up on this Session
+    // first, then on the Bot's active Session, so a line answered in a fresh part
+    // still goes back to the chat that asked.
+    const origin = originOf(session.id) ?? originOf(rt.chatOf(botId))
     if (origin === undefined) return
     for (const item of rt.displayItems(session.id, [event])) {
       if (item.kind !== 'bot' && item.kind !== 'view') continue

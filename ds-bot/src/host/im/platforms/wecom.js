@@ -83,28 +83,46 @@ export default {
       lastError = message
       handlers.onStatus({ state: 'error', error: message })
     }
-    // Passive replies reuse the last callback req_id per chat.
-    const lastReqId = new Map()
+    // Passive replies reuse the last callback req_id per chat, but only inside
+    // WeCom's reply window: a callback's req_id expires a few seconds after it
+    // arrives, and an expired one is dropped by the gateway without an error.
+    // Past that window the send falls back to aibot_send_msg, which has no
+    // window — a Bot that thinks for a minute still reaches the chat.
+    const REPLY_WINDOW_MS = 4_000
+    const lastReqId = new Map() // chat key → { id, at }
     const pending = new Map() // req_id → {resolve, reject}
+    // Callback req_ids this adapter has answered passively. A refusal for one of
+    // them concerns a single reply, not the socket: it must not fail the
+    // connection the way a refused subscribe or send does.
+    const passiveSends = new Set()
 
     const nextReqId = () => `r${++reqCounter}`
     const sendFrame = (packet) => { if (socket?.readyState === 1) socket.send(JSON.stringify(packet)) }
     const request = (cmd, body, reqId) => {
       const req_id = reqId ?? nextReqId()
-      sendFrame({ cmd, headers: { req_id }, body })
-      if (cmd === 'aibot_send_msg') {
-        return new Promise((resolve, reject) => {
+      // The waiter is registered before the frame goes out: the answer can land
+      // on the socket before this call returns, and a missing entry would then
+      // sit out the whole timeout over a reply that already arrived.
+      const waiter = cmd === 'aibot_send_msg'
+        ? new Promise((resolve, reject) => {
           pending.set(req_id, { resolve, reject })
           setTimeout(() => {
             if (pending.delete(req_id)) reject(new Error('WeCom did not answer the send'))
           }, 15_000).unref?.()
         })
-      }
+        : undefined
+      sendFrame({ cmd, headers: { req_id }, body })
+      return waiter
     }
 
     const onCallback = async (headers, body) => {
       const key = String(body.chattype === 'single' ? body.from?.userid ?? '' : body.chatid ?? '')
-      lastReqId.set(key, String(headers?.req_id ?? ''))
+      // A new message supersedes whatever reply window the previous one left
+      // open, and an empty req_id answers nothing: it clears the entry rather
+      // than leaving an older id in place to be reused by the next reply.
+      const callbackReqId = String(headers?.req_id ?? '')
+      if (callbackReqId === '') lastReqId.delete(key)
+      else lastReqId.set(key, { id: callbackReqId, at: Date.now() })
       const direct = body.chattype === 'single'
       // Groups only count when the bot was @-ed: the text keeps the mention.
       // A voice message carries its own transcription, which is all of the text
@@ -184,6 +202,14 @@ export default {
         try { packet = JSON.parse(String(data)) } catch { return }
         if (packet.errcode !== undefined) {
           if (packet.errcode !== 0) {
+            // A passive reply is answered against the callback's own req_id, which
+            // was never registered here. Its refusal says that one reply did not
+            // land — an expired window, a consumed id — not that the socket is
+            // broken, so the connection is left alone and only the send is logged.
+            if (passiveSends.delete(packet.headers?.req_id) === true) {
+              env.log?.warn?.('ds-bot im: wecom refused a passive reply: %s', String(packet.errmsg ?? packet.errcode))
+              return
+            }
             fail(String(packet.errmsg ?? `WeCom answered ${packet.errcode}`))
             const held = pending.get(packet.headers?.req_id)
             if (held !== undefined) {
@@ -229,6 +255,19 @@ export default {
     return {
       send: async (chat, { text, buttons }) => {
         const chunks = chunkMarkdown(String(text ?? ''), TEXT_LIMIT)
+        // A callback req_id answers exactly once, and only inside a few seconds.
+        // The entry is dropped the moment it is spent, so a second reply — or a
+        // second chunk — never reuses an id the gateway has already consumed and
+        // silently drops. Those go out over aibot_send_msg instead.
+        //
+        // A multi-chunk reply takes the open channel as a whole: the first chunk
+        // over the callback and the rest over aibot_send_msg would split one
+        // reply across two paths, and the open one can overtake it.
+        const held = lastReqId.get(chat.key)
+        const age = held === undefined ? -1 : Date.now() - held.at
+        const socketOpen = socket?.readyState === 1
+        const passive = held !== undefined && age < REPLY_WINDOW_MS && chunks.length === 1 && socketOpen
+        if (passive) lastReqId.delete(chat.key)
         let messageId
         for (const [index, chunk] of chunks.entries()) {
           const body = { msgtype: 'markdown', markdown: { content: chunk } }
@@ -242,12 +281,27 @@ export default {
               button_selection: { question_key: 'choice', option_list: buttons.slice(0, 10).map(b => ({ id: b.data, text: b.label.slice(0, 30) })) },
             }
           }
-          const reqId = lastReqId.get(chat.key)
-          if (reqId !== undefined) {
-            sendFrame({ cmd: 'aibot_respond_msg', headers: { req_id: reqId }, body })
+          if (passive) {
+            // Registered before the frame goes out so a refusal arriving on the
+            // same tick is attributed to this reply rather than to the socket.
+            passiveSends.add(held.id)
+            const dropPassive = setTimeout(() => passiveSends.delete(held.id), REPLY_WINDOW_MS * 2)
+            dropPassive.unref?.()
+            sendFrame({ cmd: 'aibot_respond_msg', headers: { req_id: held.id }, body })
             messageId = undefined
           } else {
-            const result = await request('aibot_send_msg', { ...body, chatid: chat.kind === 'group' ? chat.key : undefined, userid: chat.kind === 'direct' ? chat.key : undefined })
+            // `chatid` is the only addressing field the gateway takes, for both a
+            // group and a one-to-one chat: in a direct chat it is the user's own
+            // id. `userid` is not a field of this command at all — send it alone
+            // and WeCom refuses with 86201 "chatid missing". `chat_type` decides
+            // how the id is read, and without it the gateway tries the group
+            // reading first, so a direct chat has to say so.
+            const direct = chat.kind === 'direct'
+            const result = await request('aibot_send_msg', {
+              ...body,
+              chatid: chat.key,
+              chat_type: direct ? 1 : 2,
+            })
             messageId = String(result?.msgid ?? messageId ?? '')
           }
         }
